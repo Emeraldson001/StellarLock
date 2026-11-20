@@ -1,11 +1,13 @@
 import { pathToFileURL } from "node:url"
 import { Server } from "@stellar/stellar-sdk/rpc"
-import { scValToNative, xdr } from "@stellar/stellar-sdk"
+import { scValToNative, xdr, Contract, TransactionBuilder, BASE_FEE, Networks, nativeToScVal } from "@stellar/stellar-sdk"
 import { initDb, db, getMeta, setMeta, deleteMeta } from "./db"
 
 export interface IndexedLock {
   id: string
   kind: "token" | "lp"
+  /** The contract address that created this lock (token-locker or lp-locker). */
+  contractId: string
   creator: string
   beneficiary: string
   token: string
@@ -21,6 +23,13 @@ export interface IndexedLock {
   createdAt: number
   extendedCount?: number
   withdrawn?: boolean
+  /** Vesting schedule start (unix seconds), null if no vesting. */
+  vestingStart?: number | null
+  /** Vesting schedule end (unix seconds), null if no vesting. */
+  vestingEnd?: number | null
+  description?: string | null
+  projectUrl?: string | null
+  logoUrl?: string | null
 }
 
 interface AggregateStats {
@@ -53,6 +62,7 @@ function ensureDb() {
 interface LockRow {
   id: string
   kind: string
+  contract_id: string
   creator: string
   beneficiary: string
   token: string
@@ -67,13 +77,18 @@ interface LockRow {
   created_at: number
   extended_count: number
   withdrawn: number
+  vesting_start: number | null
+  vesting_end: number | null
+  description: string | null
+  project_url: string | null
+  logo_url: string | null
 }
 
 function buildStatements() {
   return {
     upsertLock: db.prepare(`
-      INSERT INTO locks (id, kind, creator, beneficiary, token, token_a, token_b, dex, pool_share, amount, unlock_at, status, created_at)
-      VALUES (@id, @kind, @creator, @beneficiary, @token, @token_a, @token_b, @dex, @pool_share, @amount, @unlock_at, 'locked', @created_at)
+      INSERT INTO locks (id, kind, contract_id, creator, beneficiary, token, token_a, token_b, dex, pool_share, amount, unlock_at, status, created_at)
+      VALUES (@id, @kind, @contract_id, @creator, @beneficiary, @token, @token_a, @token_b, @dex, @pool_share, @amount, @unlock_at, 'locked', @created_at)
       ON CONFLICT(id) DO UPDATE SET
         creator = excluded.creator,
         beneficiary = excluded.beneficiary,
@@ -85,16 +100,36 @@ function buildStatements() {
         amount = excluded.amount,
         unlock_at = excluded.unlock_at
     `),
-    markWithdrawn: db.prepare(`UPDATE locks SET status = 'withdrawn', withdrawn = 1 WHERE id = ?`),
     getAmountAndReleased: db.prepare(`SELECT amount, released FROM locks WHERE id = ?`),
     recordRelease: db.prepare(`
       UPDATE locks SET released = @released, status = @status, withdrawn = @withdrawn WHERE id = @id
     `),
     extendUnlock: db.prepare(`UPDATE locks SET unlock_at = ?, extended_count = extended_count + 1 WHERE id = ?`),
+    // After an extension, re-arm any reminder whose threshold is now in the
+    // future again, so subscribers are reminded about the new unlock date
+    // (and aren't left believing the lock already unlocked). Thresholds match
+    // the notifier's: a tier fires once seconds-until-unlock is <= its window.
+    rearmReminders: db.prepare(`
+      UPDATE notification_subscriptions SET
+        reminded_7d = CASE WHEN @unlock_at - @now > ${7 * 86_400} THEN 0 ELSE reminded_7d END,
+        reminded_1d = CASE WHEN @unlock_at - @now > 86400 THEN 0 ELSE reminded_1d END,
+        reminded_0d = CASE WHEN @unlock_at - @now > 0 THEN 0 ELSE reminded_0d END
+      WHERE lock_id = @lock_id
+    `),
     setBeneficiary: db.prepare(`UPDATE locks SET beneficiary = ? WHERE id = ?`),
     insertEvent: db.prepare(
-      `INSERT OR IGNORE INTO lock_events (id, ledger_seq, event_type, lock_id) VALUES (?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO lock_events (id, ledger_seq, event_type, lock_id, contract_id, tx_hash, ledger_closed_at, payload)
+       VALUES (@id, @ledger_seq, @event_type, @lock_id, @contract_id, @tx_hash, @ledger_closed_at, @payload)`,
     ),
+    setLockMeta: db.prepare(`
+      UPDATE locks SET
+        vesting_start = @vesting_start,
+        vesting_end   = @vesting_end,
+        description   = @description,
+        project_url   = @project_url,
+        logo_url      = @logo_url
+      WHERE id = @id
+    `),
   }
 }
 
@@ -110,6 +145,7 @@ function rowToLock(row: LockRow): IndexedLock {
   return {
     id: row.id,
     kind: row.kind as "token" | "lp",
+    contractId: row.contract_id,
     creator: row.creator,
     beneficiary: row.beneficiary,
     token: row.token,
@@ -124,6 +160,11 @@ function rowToLock(row: LockRow): IndexedLock {
     createdAt: row.created_at,
     extendedCount: row.extended_count,
     withdrawn: row.withdrawn === 1,
+    vestingStart: row.vesting_start ?? null,
+    vestingEnd: row.vesting_end ?? null,
+    description: row.description ?? null,
+    projectUrl: row.project_url ?? null,
+    logoUrl: row.logo_url ?? null,
   }
 }
 
@@ -134,9 +175,15 @@ function rowToLock(row: LockRow): IndexedLock {
 export interface ContractEvent {
   /** Unique RPC event id — used to deduplicate replayed ranges. */
   id: string
+  /** The contract address that emitted this event. Used to namespace lock ids. */
+  contractId: string
   ledger: number
   /** Ledger close time (unix seconds); used as the lock's created_at. */
   timestamp?: number
+  /** ISO-8601 ledger close time string from the RPC response. */
+  ledgerClosedAt?: string
+  /** Transaction hash for the transaction that emitted this event. */
+  txHash?: string
   topics: unknown[]
   data: unknown
 }
@@ -163,28 +210,61 @@ function applyRelease(s: ReturnType<typeof buildStatements>, lockId: string, rel
   })
 }
 
+/** Apply a lock extension and re-arm reminders whose thresholds moved back into the future. */
+function extendLock(s: ReturnType<typeof buildStatements>, lockId: string, newUnlockAt: number) {
+  s.extendUnlock.run(newUnlockAt, lockId)
+  s.rearmReminders.run({ lock_id: lockId, unlock_at: newUnlockAt, now: Math.floor(Date.now() / 1000) })
+}
+
 /**
  * Parse a locker contract event and upsert it into the SQLite index.
  * Token-locker events carry their payload in the topics; lp-locker
  * withdraw/extend/transfer events carry it in the data tuple.
  * Already-seen event ids are skipped so replays are idempotent.
+ *
+ * Returns the lock id string of a newly-created lock (token or LP) so that
+ * the caller can kick off an async `get_lock` simulation to back-fill vesting
+ * schedule and metadata (Issue #1130). Returns `undefined` for all other events.
  */
-export function processEvent(event: ContractEvent): void {
+export function processEvent(event: ContractEvent): string | undefined {
   const name = typeof event.topics[0] === "string" ? event.topics[0] : undefined
   if (!name) return
 
   const s = stmts()
   const createdAt = event.timestamp ?? Math.floor(Date.now() / 1000)
+  const ledgerClosedAt = event.timestamp ?? null
+  const txHash = event.txHash ?? null
+  const payload = JSON.stringify({ topics: event.topics, data: event.data })
+
+  // Lock ids are namespaced by the emitting contract address so that two
+  // deployments restarting their counters at the same value cannot collide.
+  // Format: "<contractAddr>:<numericId>", e.g. "CXXX…:1042".
+  const mkLockId = (numericId: unknown) => `${event.contractId}:${String(numericId)}`
+
+  /** Build the named-param object for insertEvent. */
+  const eventParams = (lid: string) => ({
+    id: event.id,
+    ledger_seq: event.ledger,
+    event_type: name,
+    lock_id: lid,
+    contract_id: event.contractId,
+    tx_hash: txHash,
+    ledger_closed_at: ledgerClosedAt,
+    payload,
+  })
+
+  let newlyCreatedLockId: string | undefined
 
   const apply = db.transaction(() => {
     switch (name) {
       case "lock_created": {
         const [, id, creator, token, amount, beneficiary, unlockAt] = event.topics
-        const lockId = `token:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
         s.upsertLock.run({
-          id: lockId,
+          id: lid,
           kind: "token",
+          contract_id: event.contractId,
           creator: String(creator),
           beneficiary: String(beneficiary),
           token: String(token),
@@ -196,6 +276,7 @@ export function processEvent(event: ContractEvent): void {
           unlock_at: Number(unlockAt),
           created_at: createdAt,
         })
+        newlyCreatedLockId = lid
         break
       }
       // Each split-group child now publishes its own `lock_created` event
@@ -207,35 +288,38 @@ export function processEvent(event: ContractEvent): void {
       // beneficiary.
       case "split_lock_created": {
         const [, groupId] = event.topics
-        const lockId = `token:${String(groupId)}`
-        s.insertEvent.run(event.id, event.ledger, name, lockId)
+        const lid = mkLockId(groupId)
+        s.insertEvent.run(eventParams(lid))
         break
       }
       case "lock_withdrawn": {
         const [, id, , , releasable] = event.topics
-        const lockId = `token:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        applyRelease(s, lockId, BigInt(releasable as bigint))
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        applyRelease(s, lid, BigInt(releasable as bigint))
         break
       }
       case "lock_extended": {
         const [, id, , , newUnlockAt] = event.topics
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        s.extendUnlock.run(Number(newUnlockAt), lid)
         const lockId = `token:${String(id)}`
         if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        s.extendUnlock.run(Number(newUnlockAt), lockId)
+        extendLock(s, lockId, Number(newUnlockAt))
         break
       }
       case "beneficiary_transferred": {
         const [, id, , newBeneficiary] = event.topics
-        const lockId = `token:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        s.setBeneficiary.run(String(newBeneficiary), lockId)
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        s.setBeneficiary.run(String(newBeneficiary), lid)
         break
       }
       case "lp_lock_created": {
         const [, id, creator, poolShare, amount, beneficiary, unlockAt] = event.topics
-        const lockId = `lp:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
         // The contract emits (dex, token_a, token_b) as the event data tuple.
         // scValToNative converts a Soroban enum variant like Dex::Aquarius to
         // { Aquarius: {} }, so extract the first key as the dex name string.
@@ -243,8 +327,9 @@ export function processEvent(event: ContractEvent): void {
         const dexStr =
           dex != null && typeof dex === "object" ? (Object.keys(dex)[0] ?? null) : typeof dex === "string" ? dex : null
         s.upsertLock.run({
-          id: lockId,
+          id: lid,
           kind: "lp",
+          contract_id: event.contractId,
           creator: String(creator),
           beneficiary: String(beneficiary),
           token: String(poolShare),
@@ -256,40 +341,41 @@ export function processEvent(event: ContractEvent): void {
           unlock_at: Number(unlockAt),
           created_at: createdAt,
         })
+        newlyCreatedLockId = lid
         break
       }
       case "lp_lock_withdrawn": {
         // Contract emits topics=(symbol, id), data=(beneficiary, pool_share, releasable).
-        // Like the token-locker, a vesting LP lock can emit several of these
-        // (one per partial claim), so cumulative tracking via applyRelease is
-        // required — unconditionally marking "withdrawn" here would wrongly
-        // close out a lock after its first partial claim.
-        // Contract emits topics=(symbol, id), data=(beneficiary, pool_share, releasable) —
-        // a vesting LP lock can emit several of these (one per partial
-        // claim), so cumulative tracking via applyRelease is required.
+        // A vesting LP lock can emit several of these (one per partial claim),
+        // so cumulative tracking via applyRelease is required — unconditionally
+        // marking "withdrawn" here would wrongly close out a lock after its
+        // first partial claim.
         const [, id] = event.topics
         const [, , releasable] = event.data as unknown[]
-        const lockId = `lp:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        applyRelease(s, lockId, BigInt(releasable as bigint))
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        applyRelease(s, lid, BigInt(releasable as bigint))
         break
       }
       case "lp_lock_extended": {
         // Contract emits topics=(symbol, id), data=(creator, old_unlock_at, new_unlock_at).
         const [, id] = event.topics
         const [, , newUnlockAt] = event.data as unknown[]
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        s.extendUnlock.run(Number(newUnlockAt), lid)
         const lockId = `lp:${String(id)}`
         if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        s.extendUnlock.run(Number(newUnlockAt), lockId)
+        extendLock(s, lockId, Number(newUnlockAt))
         break
       }
       case "lp_beneficiary_transferred": {
         // Contract emits topics=(symbol, id), data=(old_beneficiary, new_beneficiary).
         const [, id] = event.topics
         const [, newBeneficiary] = event.data as unknown[]
-        const lockId = `lp:${String(id)}`
-        if (!s.insertEvent.run(event.id, event.ledger, name, lockId).changes) return
-        s.setBeneficiary.run(String(newBeneficiary), lockId)
+        const lid = mkLockId(id)
+        if (!s.insertEvent.run(eventParams(lid)).changes) return
+        s.setBeneficiary.run(String(newBeneficiary), lid)
         break
       }
       // Each split-group child now publishes its own `lp_lock_created` event
@@ -300,8 +386,8 @@ export function processEvent(event: ContractEvent): void {
       // total and the creator standing in as beneficiary.
       case "lp_split_lock_created": {
         const [, groupId] = event.topics
-        const lockId = `lp:${String(groupId)}`
-        s.insertEvent.run(event.id, event.ledger, name, lockId)
+        const lid = mkLockId(groupId)
+        s.insertEvent.run(eventParams(lid))
         break
       }
       default:
@@ -310,6 +396,130 @@ export function processEvent(event: ContractEvent): void {
     }
   })
   apply()
+  return newlyCreatedLockId
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1130 — Vesting schedule + metadata back-fill via get_lock simulation
+// ---------------------------------------------------------------------------
+
+/** Minimal RPC server interface needed for get_lock simulations (injectable in tests). */
+export interface SimulationServer {
+  simulateTransaction(tx: unknown): Promise<{
+    error?: string
+    result?: { retval: xdr.ScVal }
+  }>
+}
+
+/**
+ * Simulate a `get_lock` call against TOKEN_LOCKER_ID and store the resulting
+ * vesting schedule and project metadata on the already-indexed lock row.
+ *
+ * Uses a dummy source account (all-zeros public key) — the same approach the
+ * frontend uses in `src/lib/stellar.ts`. The simulation never touches the
+ * ledger so the source account need not actually exist.
+ *
+ * Runs outside any DB transaction; failures are logged and swallowed so a
+ * failed metadata fetch never aborts the event that triggered it.
+ */
+export async function backfillLockMeta(
+  lockId: string,
+  server: SimulationServer,
+): Promise<void> {
+  // lockId is "<contractAddr>:<numericId>" for token locks — extract the parts.
+  // LP lock ids share the same format but `get_lock` only exists on the
+  // token-locker contract, so skip non-token locks.
+  const match = /^([A-Z0-9]{56}):(\d+)$/.exec(lockId)
+  if (!match) return
+
+  const contractAddr = match[1]
+  const numericId = match[2]
+
+  // Only call get_lock on contracts that are known token-locker deployments.
+  if (!TOKEN_LOCKER_ID || contractAddr !== TOKEN_LOCKER_ID) {
+    // If a secondary token-locker contract address is ever added via env, it
+    // would be listed here. For now a single TOKEN_LOCKER_CONTRACT is enough.
+    return
+  }
+
+  try {
+    const dummySource = {
+      accountId: () => "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      sequenceNumber: () => "0",
+      incrementSequenceNumber: () => {},
+    }
+
+    const networkPassphrase = process.env.NETWORK_PASSPHRASE ?? Networks.TESTNET
+
+    const contract = new Contract(contractAddr)
+    const tx = new TransactionBuilder(dummySource as unknown as Parameters<typeof TransactionBuilder>[0], {
+      fee: BASE_FEE,
+      networkPassphrase,
+    })
+      .addOperation(contract.call("get_lock", nativeToScVal(BigInt(numericId), { type: "u64" })))
+      .setTimeout(30)
+      .build()
+
+    const sim = await server.simulateTransaction(tx)
+    if (!sim.result?.retval || (sim as { error?: string }).error) return
+
+    const raw = scValToNative(sim.result.retval) as Record<string, unknown> | null
+    if (!raw) return
+
+    // Vesting: sentinel (start=0, end=0) means no vesting schedule.
+    const vestingRaw = raw.vesting as { start: bigint; end: bigint } | null | undefined
+    const hasVesting = vestingRaw != null && !(Number(vestingRaw.start) === 0 && Number(vestingRaw.end) === 0)
+
+    // Metadata: empty strings mean "not set".
+    const metaRaw = raw.metadata as { description: string; project_url: string; logo_url: string } | null | undefined
+
+    stmts().setLockMeta.run({
+      id: lockId,
+      vesting_start: hasVesting ? Number(vestingRaw!.start) : null,
+      vesting_end:   hasVesting ? Number(vestingRaw!.end)   : null,
+      description:   metaRaw?.description  || null,
+      project_url:   metaRaw?.project_url  || null,
+      logo_url:      metaRaw?.logo_url     || null,
+    })
+
+    console.log(`[indexer] back-filled vesting/metadata for ${lockId}`)
+  } catch (err) {
+    console.warn(`[indexer] get_lock simulation failed for ${lockId}:`, err)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1129 — Lock event history query
+// ---------------------------------------------------------------------------
+
+export interface IndexedLockEvent {
+  id: string
+  ledger_seq: number
+  event_type: string
+  lock_id: string
+  contract_id: string
+  tx_hash: string | null
+  ledger_closed_at: number | null
+  payload: string | null
+}
+
+/**
+ * Return all events for a given lock ordered oldest-first, suitable for
+ * serving the GET /api/indexer-lock-events?lockId= endpoint.
+ *
+ * @param lockId - Canonical lock id (e.g. `"CXXX…:42"` or `"CYYY…:7"`).
+ * @returns Events ordered by ledger_seq ASC, then id ASC.
+ */
+export function getLockEvents(lockId: string): IndexedLockEvent[] {
+  ensureDb()
+  return db
+    .prepare(
+      `SELECT id, ledger_seq, event_type, lock_id, contract_id, tx_hash, ledger_closed_at, payload
+       FROM lock_events
+       WHERE lock_id = ?
+       ORDER BY ledger_seq ASC, id ASC`,
+    )
+    .all(lockId) as IndexedLockEvent[]
 }
 
 export function getStats(): AggregateStats {
@@ -321,8 +531,8 @@ export function getStats(): AggregateStats {
     .get() as { totalLocks: number; uniqueTokens: number }
 
   const totalValue = (
-    db.prepare("SELECT amount FROM locks WHERE status = 'locked'").all() as { amount: string }[]
-  ).reduce((sum, r) => sum + BigInt(r.amount), BigInt(0))
+    db.prepare("SELECT amount, released FROM locks WHERE status = 'locked'").all() as { amount: string; released: string }[]
+  ).reduce((sum, r) => sum + BigInt(r.amount) - BigInt(r.released), BigInt(0))
 
   const recentLocks = (
     db.prepare("SELECT * FROM locks ORDER BY created_at DESC, id DESC LIMIT 10").all() as LockRow[]
@@ -349,7 +559,7 @@ export function getLocksForToken(token: string): IndexedLock[] {
   return rows.map(rowToLock)
 }
 
-export interface LockPage {
+interface LockPage {
   locks: IndexedLock[]
   total: number
 }
@@ -377,16 +587,17 @@ export interface TokenAggregate {
  */
 export function getTopTokens(limit = 50): TokenAggregate[] {
   ensureDb()
-  const rows = db.prepare("SELECT token, amount FROM locks WHERE status = 'locked'").all() as {
+  const rows = db.prepare("SELECT token, amount, released FROM locks WHERE status = 'locked'").all() as {
     token: string
     amount: string
+    released: string
   }[]
 
   const byToken = new Map<string, TokenAggregate>()
   for (const r of rows) {
     const entry = byToken.get(r.token) ?? { token: r.token, lockCount: 0, totalLocked: 0n }
     entry.lockCount++
-    entry.totalLocked += BigInt(r.amount)
+    entry.totalLocked += BigInt(r.amount) - BigInt(r.released)
     byToken.set(r.token, entry)
   }
 
@@ -401,7 +612,7 @@ export function getLastIndexed(): number {
 }
 
 /** Minimal surface of the Soroban RPC Server the poller needs (injectable in tests). */
-export interface EventSource {
+interface EventSource {
   getLatestLedger(): Promise<{ sequence: number }>
   getEvents(request: {
     startLedger?: number
@@ -413,8 +624,11 @@ export interface EventSource {
     cursor?: string
     events: {
       id: string
+      /** Contract address that emitted this event. */
+      contractId?: string
       ledger: number
       ledgerClosedAt?: string
+      txHash?: string
       topic: xdr.ScVal[]
       value: xdr.ScVal
     }[]
@@ -487,14 +701,25 @@ export async function pollOnce(server: EventSource): Promise<number> {
   let processed = 0
   for (const raw of resp.events) {
     try {
-      processEvent({
+      const newLockId = processEvent({
         id: raw.id,
+        contractId: raw.contractId ?? "",
         ledger: raw.ledger,
         timestamp: raw.ledgerClosedAt ? Math.floor(Date.parse(raw.ledgerClosedAt) / 1000) : undefined,
+        ledgerClosedAt: raw.ledgerClosedAt,
+        txHash: raw.txHash,
         topics: raw.topic.map((t): unknown => scValToNative(t)),
         data: raw.value ? scValToNative(raw.value) : undefined,
       })
       processed++
+      // Issue #1130: kick off an async get_lock simulation to back-fill
+      // vesting schedule and metadata for newly created token locks.
+      // The result is best-effort — a failure here never aborts indexing.
+      if (newLockId) {
+        void backfillLockMeta(newLockId, server as unknown as SimulationServer).catch((err) => {
+          console.warn(`[indexer] backfillLockMeta failed for ${newLockId}:`, err)
+        })
+      }
     } catch (err) {
       console.error(`[indexer] failed to process event ${raw.id}:`, err)
     }
@@ -515,7 +740,7 @@ export async function pollOnce(server: EventSource): Promise<number> {
   return processed
 }
 
-export interface PollerHandle {
+interface PollerHandle {
   stop(): void
 }
 
@@ -530,7 +755,14 @@ export function startPolling(options: { server?: EventSource; intervalMs?: numbe
     if (inFlight) return
     inFlight = true
     try {
-      await pollOnce(server)
+      // Drain all consecutive full pages before waiting for the next interval.
+      // A fresh indexer catching up after downtime can have many pages of 100
+      // events queued; waiting a full poll interval between pages would make
+      // catch-up take 10 s × (number of pages) instead of being near-instant.
+      let count: number
+      do {
+        count = await pollOnce(server)
+      } while (count >= EVENTS_PAGE_LIMIT)
     } catch (err) {
       console.error("[indexer] poll failed:", err)
     } finally {
@@ -550,5 +782,23 @@ const isMain =
 
 if (isMain) {
   console.log(`[indexer] polling ${RPC_URL} every ${POLL_INTERVAL_MS}ms`)
-  startPolling()
+  const poller = startPolling()
+
+  let shuttingDown = false
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.log(`[indexer] received ${signal}, shutting down gracefully…`)
+    poller.stop()
+    // Give any in-flight poll tick up to 30 s to finish before we close the DB.
+    // The tick sets `inFlight = false` when it completes, but we have no direct
+    // handle to that flag here — a small delay is the simplest safe approach.
+    await new Promise<void>((resolve) => setTimeout(resolve, 500))
+    db.close()
+    console.log(`[indexer] clean shutdown complete`)
+    process.exit(0)
+  }
+
+  process.on('SIGTERM', () => { void shutdown('SIGTERM') })
+  process.on('SIGINT',  () => { void shutdown('SIGINT') })
 }

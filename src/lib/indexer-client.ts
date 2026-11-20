@@ -9,6 +9,8 @@ const log = createLogger("indexer-client")
 export interface IndexerLockDTO {
   id: string
   kind: "token" | "lp"
+  /** Contract address that created this lock (token-locker or lp-locker). */
+  contractId: string
   creator: string
   beneficiary: string
   token: string
@@ -17,6 +19,7 @@ export interface IndexerLockDTO {
   dex?: string | null
   pool_share?: string | null
   amount: string
+  released: string
   unlockAt: number
   status: "locked" | "withdrawn"
   createdAt: number

@@ -12,6 +12,7 @@ import {
   scheduleUnlockReminder,
   subscribeNotifications,
   unsubscribeNotifications,
+  type SignMessageFn,
 } from "@/hooks/useNotifications"
 
 interface Props {
@@ -19,14 +20,17 @@ interface Props {
   unlockAt: number
   /** Connected wallet address — required to register server-side subscriptions. */
   address?: string
+  /** Wallet message signer — proves ownership of `address` to the subscription API. */
+  signMessage?: SignMessageFn
 }
 
-export function NotificationSettings({ lockId, unlockAt, address }: Props) {
+export function NotificationSettings({ lockId, unlockAt, address, signMessage }: Props) {
   const { t } = useTranslation()
   const { prefs, update } = useNotificationPrefs(lockId)
   const { permission, requestPermission } = useBrowserNotifications()
   const [webhookInput, setWebhookInput] = useState(prefs.webhookUrl ?? "")
   const [webhookSaved, setWebhookSaved] = useState(false)
+  const [webhookError, setWebhookError] = useState<string | null>(null)
 
   // Email state
   const [emailInput, setEmailInput] = useState(prefs.email ?? "")
@@ -69,7 +73,7 @@ export function NotificationSettings({ lockId, unlockAt, address }: Props) {
       if (prefs.email && address) {
         setEmailLoading(true)
         try {
-          await unsubscribeNotifications(lockId, address)
+          await unsubscribeNotifications(lockId, address, signMessage)
           update({ email: undefined })
         } catch {
           setEmailError(t("notifications.emailError"))
@@ -93,7 +97,7 @@ export function NotificationSettings({ lockId, unlockAt, address }: Props) {
 
     setEmailLoading(true)
     try {
-      await subscribeNotifications({ lockId, address, email, webhookUrl: prefs.webhookUrl })
+      await subscribeNotifications({ lockId, address, email, webhookUrl: prefs.webhookUrl, signMessage })
       update({ email })
       setEmailSaved(true)
       setTimeout(() => setEmailSaved(false), 2000)
